@@ -1,0 +1,75 @@
+name: offboard-google-transfer
+
+# Triggered by Okta Workflows (GitHub "workflow_dispatch" API) BEFORE the user is
+# added to the offboarded group / deactivated. Fails the run if the transfer fails,
+# so the Okta flow can halt and alert instead of deactivating.
+on:
+  workflow_dispatch:
+    inputs:
+      owner:
+        description: "Departing user's email"
+        required: true
+      dry_run:
+        description: "List what would transfer, change nothing"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: offboard-${{ inputs.owner }}
+
+jobs:
+  transfer:
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_wrapper: false
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - run: pip install -r scripts/requirements.txt
+
+      - name: Write secrets to disk
+        run: |
+          umask 077
+          printf '%s' "$TFVARS" > terraform/terraform.auto.tfvars
+          printf '%s' "$GWS_SA_KEY" > terraform/sa-key.json
+        env:
+          TFVARS: ${{ secrets.TFVARS }}
+          GWS_SA_KEY: ${{ secrets.GWS_SA_KEY }}
+
+      - name: Resolve delegate from last-applied Terraform state
+        id: delegate
+        working-directory: terraform
+        run: |
+          terraform init -input=false
+          d=$(terraform output -json offboarding_delegates | jq -r --arg o "${OWNER,,}" '.[$o] // empty')
+          if [ -z "$d" ]; then echo "No delegate resolved for $OWNER" >&2; exit 1; fi
+          echo "delegate=$d" >> "$GITHUB_OUTPUT"
+        env:
+          OWNER: ${{ inputs.owner }}
+
+      - name: Transfer Google Workspace assets
+        run: |
+          args=(--owner "$OWNER" --delegate "$DELEGATE" --sa-key terraform/sa-key.json --admin "$ADMIN")
+          if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+          python scripts/gws_offboard_transfer.py "${args[@]}"
+        env:
+          OWNER: ${{ inputs.owner }}
+          DELEGATE: ${{ steps.delegate.outputs.delegate }}
+          ADMIN: ${{ vars.GWS_ADMIN_EMAIL }}
+          DRY_RUN: ${{ inputs.dry_run }}
+
+      - name: Remove secrets
+        if: always()
+        run: rm -f terraform/sa-key.json terraform/terraform.auto.tfvars

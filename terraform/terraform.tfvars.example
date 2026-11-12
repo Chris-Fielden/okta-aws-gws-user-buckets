@@ -1,0 +1,12 @@
+okta_org_name          = "acme"
+email_domain           = "acme.com"
+gws_customer_id        = "C0xxxxxxx"
+gws_impersonated_admin = "admin@acme.com"
+gws_credentials_file   = "./sa-key.json"
+
+fallback_delegate_email = "it-owner@acme.com"
+
+manager = {
+  "alice@acme.com" = "bob@acme.com"
+  "bob@acme.com"   = "carol@acme.com"
+}
