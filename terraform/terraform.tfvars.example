@@ -1,12 +1,30 @@
-okta_org_name          = "acme"
-email_domain           = "acme.com"
-gws_customer_id        = "C0xxxxxxx"
-gws_impersonated_admin = "admin@acme.com"
-gws_credentials_file   = "./sa-key.json"
+# Copy to terraform.tfvars (git-ignored) and replace every <PLACEHOLDER>.
+# Nothing here is a real value; each placeholder names what to supply.
 
-fallback_delegate_email = "it-owner@acme.com"
+# Okta org subdomain: the part before ".okta.com" in your Okta URL.
+okta_org_name = "<OKTA_ORG_SUBDOMAIN>"
 
+# Your Google Workspace primary domain, WITHOUT the "@". Every recipient email must end in it.
+email_domain = "<GOOGLE_WORKSPACE_DOMAIN>"
+
+# Google Workspace customer ID (Admin console > Account > Account settings).
+gws_customer_id = "<GWS_CUSTOMER_ID>"
+
+# A Workspace admin the service account impersonates (read-only directory lookups).
+gws_impersonated_admin = "<GWS_ADMIN_EMAIL>"
+
+# Path to the service account JSON key (never commit it).
+gws_credentials_file = "<PATH_TO_SERVICE_ACCOUNT_KEY_JSON>"
+
+# Last-resort recipient when no one in a user's manager chain is available.
+# Use a real, monitored account (e.g. an IT/security owner). Must also exist in
+# Identity Center with a userName equal to this email. Remove the line to make
+# the plan FAIL instead of falling back.
+fallback_delegate_email = "<FALLBACK_OWNER_EMAIL>"
+
+# user email => that user's manager email. Add one entry per user; the chain is
+# walked through this same map (a manager's own entry gives the next level up).
 manager = {
-  "alice@acme.com" = "bob@acme.com"
-  "bob@acme.com"   = "carol@acme.com"
+  "<USER_EMAIL>"    = "<THEIR_MANAGER_EMAIL>"
+  "<MANAGER_EMAIL>" = "<MANAGERS_MANAGER_EMAIL>"
 }

@@ -5,7 +5,7 @@ variable "aws_region" {
 }
 
 variable "okta_org_name" {
-  description = "Okta org subdomain, e.g. 'acme' for acme.okta.com."
+  description = "Okta org subdomain: the part before '.okta.com' in your Okta URL."
   type        = string
 }
 
@@ -30,22 +30,25 @@ variable "manager" {
   description = "Map of user email => that user's manager email. Also used to walk up the chain when a manager is offboarded."
   type        = map(string)
   default     = {}
-  # Example:
-  # {
-  #   "alice@acme.com" = "bob@acme.com"
-  #   "bob@acme.com"   = "carol@acme.com"
-  # }
+  # Shape (supply real addresses in terraform.tfvars; see terraform.tfvars.example):
+  #   { "<user email>" = "<that user's manager email>", ... }
+  # A manager's own entry supplies the next level up the chain.
 }
 
 variable "fallback_delegate_email" {
-  description = "Used when no one in the manager chain is available (e.g. a security/IT-owner account). Must be in email_domain and match the SCIM userName in Identity Center. Null = fail the plan instead."
+  description = "Used when no one in the manager chain is available (use a real, monitored account such as an IT/security owner). Must be in email_domain and match the SCIM userName in Identity Center. Null = fail the plan instead."
   type        = string
   default     = null
 }
 
 variable "email_domain" {
-  description = "Only recipients whose email ends in this domain are allowed (your Google Workspace domain)."
+  description = "Your Google Workspace primary domain WITHOUT the '@'. Only recipients whose email ends in it are allowed."
   type        = string
+
+  validation {
+    condition     = !startswith(var.email_domain, "@") && length(regexall("\\.", var.email_domain)) > 0
+    error_message = "email_domain must be a bare domain such as your Workspace domain (no leading '@')."
+  }
 }
 
 variable "gws_credentials_file" {
@@ -55,7 +58,7 @@ variable "gws_credentials_file" {
 }
 
 variable "gws_customer_id" {
-  description = "Google Workspace customer ID (e.g. C0xxxxxxx)."
+  description = "Google Workspace customer ID (Admin console > Account > Account settings)."
   type        = string
 }
 
