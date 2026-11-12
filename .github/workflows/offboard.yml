@@ -1,30 +1,41 @@
 name: offboard-google-transfer
 
-# Triggered by Okta Workflows (GitHub "workflow_dispatch" API) BEFORE the user is
-# added to the offboarded group / deactivated. Fails the run if the transfer fails,
-# so the Okta flow can halt and alert instead of deactivating.
+# Called by Okta Flow 2 BEFORE the user is moved to the offboarded group or deactivated.
+# `run-name` makes the run findable by Okta: display_title == "offboard <owner email>".
+# The run FAILS if the transfer fails, so Okta can stop and alert instead of deactivating.
+run-name: offboard ${{ inputs.owner }}
+
 on:
   workflow_dispatch:
     inputs:
       owner:
-        description: "Departing user's email"
+        description: "Departing user's email (lowercase)"
         required: true
+        type: string
       dry_run:
-        description: "List what would transfer, change nothing"
+        description: "List what would transfer; change nothing"
         type: boolean
         default: false
+      only_apps:
+        description: "Optional comma-separated Google app names to transfer (blank = all)"
+        type: string
+        default: ""
 
 permissions:
   contents: read
   id-token: write
 
+# Never run two transfers for the same person at once.
 concurrency:
   group: offboard-${{ inputs.owner }}
+  cancel-in-progress: false
 
 jobs:
   transfer:
     runs-on: ubuntu-latest
-    environment: production
+    # Create a GitHub environment named "offboarding" WITHOUT required reviewers
+    # (automation must not wait for a human). Restrict it to the main branch.
+    environment: offboarding
     steps:
       - uses: actions/checkout@v4
       - uses: hashicorp/setup-terraform@v3
@@ -53,8 +64,12 @@ jobs:
         working-directory: terraform
         run: |
           terraform init -input=false
-          d=$(terraform output -json offboarding_delegates | jq -r --arg o "${OWNER,,}" '.[$o] // empty')
-          if [ -z "$d" ]; then echo "No delegate resolved for $OWNER" >&2; exit 1; fi
+          owner="$(printf '%s' "$OWNER" | tr '[:upper:]' '[:lower:]')"
+          d=$(terraform output -json offboarding_delegates | jq -r --arg o "$owner" '.[$o] // empty')
+          if [ -z "$d" ]; then
+            echo "No delegate for $owner in Terraform state. Is the user in the eligible group and has Terraform applied since the manager map changed?" >&2
+            exit 1
+          fi
           echo "delegate=$d" >> "$GITHUB_OUTPUT"
         env:
           OWNER: ${{ inputs.owner }}
@@ -63,12 +78,14 @@ jobs:
         run: |
           args=(--owner "$OWNER" --delegate "$DELEGATE" --sa-key terraform/sa-key.json --admin "$ADMIN")
           if [ "$DRY_RUN" = "true" ]; then args+=(--dry-run); fi
+          if [ -n "$ONLY_APPS" ]; then args+=(--only-apps "$ONLY_APPS"); fi
           python scripts/gws_offboard_transfer.py "${args[@]}"
         env:
           OWNER: ${{ inputs.owner }}
           DELEGATE: ${{ steps.delegate.outputs.delegate }}
           ADMIN: ${{ vars.GWS_ADMIN_EMAIL }}
           DRY_RUN: ${{ inputs.dry_run }}
+          ONLY_APPS: ${{ inputs.only_apps }}
 
       - name: Remove secrets
         if: always()

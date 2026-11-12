@@ -1,18 +1,36 @@
 name: terraform
 
+# - Pull requests: fmt + validate only (no credentials needed).
+# - Manual / Okta-triggered dispatch: plan, and optionally apply.
+#   Okta Flow 3/4 calls this with apply=true and a `reason` it can search for (docs/OKTA_WORKFLOWS.md).
+run-name: terraform apply=${{ inputs.apply || 'n/a' }} ${{ inputs.reason || '' }}
+
 on:
   pull_request:
     paths: ["terraform/**", ".github/workflows/terraform.yml"]
   workflow_dispatch:
     inputs:
       apply:
-        description: "Apply after plan (requires environment approval)"
+        description: "Apply after plan"
         type: boolean
         default: false
+      reason:
+        description: "Free text used to correlate this run (Okta passes e.g. 'offboard <email> <timestamp>')"
+        type: string
+        default: ""
+      environment:
+        description: "GitHub environment to run in. Use one WITH required reviewers for humans, one WITHOUT for Okta-triggered runs."
+        type: string
+        default: "production"
 
 permissions:
   contents: read
   id-token: write # AWS OIDC
+
+# One run at a time: never two applies against the same state.
+concurrency:
+  group: terraform-state
+  cancel-in-progress: false
 
 jobs:
   validate:
@@ -31,7 +49,7 @@ jobs:
   plan-apply:
     if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
-    environment: production # configure required reviewers on this environment
+    environment: ${{ inputs.environment }}
     env:
       OKTA_API_TOKEN: ${{ secrets.OKTA_API_TOKEN }}
     steps:
@@ -50,10 +68,13 @@ jobs:
         env:
           TFVARS: ${{ secrets.TFVARS }}
           GWS_SA_KEY: ${{ secrets.GWS_SA_KEY }}
-      - run: terraform init
+      - run: terraform init -input=false
         working-directory: terraform
-      - run: terraform plan -out=tfplan
+      - run: terraform plan -input=false -out=tfplan
         working-directory: terraform
       - if: inputs.apply
-        run: terraform apply tfplan
+        run: terraform apply -input=false tfplan
         working-directory: terraform
+      - name: Remove secrets
+        if: always()
+        run: rm -f terraform/sa-key.json terraform/terraform.auto.tfvars terraform/tfplan

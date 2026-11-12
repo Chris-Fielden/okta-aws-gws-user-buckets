@@ -1,30 +1,54 @@
 # Copy to terraform.tfvars (git-ignored) and replace every <PLACEHOLDER>.
-# Nothing here is a real value; each placeholder names what to supply.
+# Nothing here is a real value. Full write-up of each variable: docs/VARIABLES.md.
+# In CI this whole file's contents live in the TFVARS GitHub secret.
+
+# ---- REQUIRED --------------------------------------------------------------
 
 # Okta org subdomain: the part before ".okta.com" in your Okta URL.
 okta_org_name = "<OKTA_ORG_SUBDOMAIN>"
 
-# Your Google Workspace primary domain, WITHOUT the "@". Every recipient email must end in it.
+# Your Google Workspace primary domain, WITHOUT the "@". Recipients must end in it.
 email_domain = "<GOOGLE_WORKSPACE_DOMAIN>"
 
 # Google Workspace customer ID (Admin console > Account > Account settings).
 gws_customer_id = "<GWS_CUSTOMER_ID>"
 
-# A Workspace admin the service account impersonates (read-only directory lookups).
+# Workspace admin the service account impersonates for directory reads.
 gws_impersonated_admin = "<GWS_ADMIN_EMAIL>"
 
-# Path to the service account JSON key (never commit it).
-gws_credentials_file = "<PATH_TO_SERVICE_ACCOUNT_KEY_JSON>"
+# Path to the service account JSON key. In CI the workflow writes it to ./sa-key.json.
+gws_credentials_file = "./sa-key.json"
+
+# ---- STRONGLY RECOMMENDED --------------------------------------------------
 
 # Last-resort recipient when no one in a user's manager chain is available.
-# Use a real, monitored account (e.g. an IT/security owner). Must also exist in
-# Identity Center with a userName equal to this email. Remove the line to make
-# the plan FAIL instead of falling back.
+# A real, monitored account that exists in Google Workspace and Identity Center.
+# Remove this line to make the plan FAIL instead of falling back.
 fallback_delegate_email = "<FALLBACK_OWNER_EMAIL>"
 
-# user email => that user's manager email. Add one entry per user; the chain is
-# walked through this same map (a manager's own entry gives the next level up).
+# user email => that user's manager email (walked up to 5 levels).
 manager = {
   "<USER_EMAIL>"    = "<THEIR_MANAGER_EMAIL>"
   "<MANAGER_EMAIL>" = "<MANAGERS_MANAGER_EMAIL>"
 }
+
+# ---- OPTIONAL (defaults shown; uncomment to change) ------------------------
+
+# aws_region                = "us-east-1"            # Identity Center home region
+# name_prefix               = "ub"                   # 2-15 chars, make it company-unique
+# session_duration          = "PT8H"
+# tags                      = { ManagedBy = "terraform", Purpose = "per-user-bucket" }
+
+# okta_base_url             = "okta.com"
+# okta_group_name           = "aws-user-bucket-eligible"
+# okta_offboarded_group_name = "aws-user-bucket-offboarded"
+# okta_departed_group_name  = "<GROUP_OF_ALL_DEPARTED_STAFF>"   # null = disabled
+
+# scim_username_attribute   = "email"                # or "login"
+# delegate_username_overrides = { "<DELEGATE_EMAIL>" = "<ITS_IDENTITY_CENTER_USERNAME>" }
+
+# bucket_force_destroy      = false
+# bucket_noncurrent_version_expiration_days = 0      # 0 = keep all versions
+# bucket_object_event_types = ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"]
+# enable_config_change_notifications = true          # needs a CloudTrail trail
+# gws_oauth_scopes          = ["https://www.googleapis.com/auth/admin.directory.user.readonly"]

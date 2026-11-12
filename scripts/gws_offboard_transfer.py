@@ -44,9 +44,11 @@ def list_applications(transfer):
             return apps
 
 
-def build_app_transfers(apps):
+def build_app_transfers(apps, only_apps=None):
     entries = []
     for app in apps:
+        if only_apps and app.get("name", "").lower() not in only_apps:
+            continue
         keys = {p["key"] for p in app.get("transferParams", [])}
         params = []
         if "PRIVACY_LEVEL" in keys:  # Drive & Docs: shared + private files
@@ -61,7 +63,7 @@ def build_app_transfers(apps):
     return entries
 
 
-def run_transfer(transfer, old_id, new_id, entries, timeout):
+def run_transfer(transfer, old_id, new_id, entries, timeout, poll_seconds):
     body = {
         "oldOwnerUserId": old_id,
         "newOwnerUserId": new_id,
@@ -79,7 +81,7 @@ def run_transfer(transfer, old_id, new_id, entries, timeout):
         if code == "failed":
             print(f"Transfer failed: {status}", file=sys.stderr)
             return False
-        time.sleep(30)
+        time.sleep(poll_seconds)
     print("Timed out waiting for transfer; it may still be running.", file=sys.stderr)
     return False
 
@@ -105,7 +107,13 @@ def main():
     p.add_argument("--delegate", required=True, help="recipient email (from `terraform output offboarding_delegates`)")
     p.add_argument("--sa-key", required=True, help="service account JSON key file")
     p.add_argument("--admin", required=True, help="Workspace admin to impersonate")
-    p.add_argument("--timeout", type=int, default=3600)
+    p.add_argument("--timeout", type=int, default=3600, help="max seconds to wait for the transfer")
+    p.add_argument("--poll-seconds", type=int, default=30, help="status polling interval")
+    p.add_argument(
+        "--only-apps",
+        default="",
+        help="comma-separated Google application names to transfer (default: every transferable app)",
+    )
     p.add_argument("--skip-gmail-delegate", action="store_true")
     p.add_argument("--dry-run", action="store_true")
     a = p.parse_args()
@@ -123,12 +131,15 @@ def main():
         sys.exit(f"delegate {delegate} is suspended; pick another delegate")
 
     print(f"Transferring {owner} -> {delegate}")
-    entries = build_app_transfers(list_applications(transfer))
+    only = {n.strip().lower() for n in a.only_apps.split(",") if n.strip()} or None
+    entries = build_app_transfers(list_applications(transfer), only)
+    if not entries:
+        sys.exit("no applications selected for transfer; check --only-apps")
     if a.dry_run:
         print("Dry run: nothing changed.")
         return
 
-    ok = run_transfer(transfer, old["id"], new["id"], entries, a.timeout)
+    ok = run_transfer(transfer, old["id"], new["id"], entries, a.timeout, a.poll_seconds)
     if not a.skip_gmail_delegate:
         add_gmail_delegate(a.sa_key, owner, delegate)
     sys.exit(0 if ok else 1)

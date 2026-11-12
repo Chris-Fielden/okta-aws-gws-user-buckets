@@ -2,7 +2,7 @@ data "aws_caller_identity" "current" {}
 data "aws_ssoadmin_instances" "this" {}
 
 # ---------------------------------------------------------------------------
-# 1. Okta: active owners and offboarded owners
+# 1. Okta: active owners, offboarded owners, and (optionally) all departed staff
 # ---------------------------------------------------------------------------
 data "okta_group" "eligible" {
   name          = var.okta_group_name
@@ -14,14 +14,29 @@ data "okta_group" "offboarded" {
   include_users = true
 }
 
+data "okta_group" "departed" {
+  count         = var.okta_departed_group_name == null ? 0 : 1
+  name          = var.okta_departed_group_name
+  include_users = true
+}
+
 locals {
   offboarded_ids = toset(data.okta_group.offboarded.users)
   owner_ids      = setunion(toset(data.okta_group.eligible.users), local.offboarded_ids)
+  departed_ids   = toset(try(data.okta_group.departed[0].users, []))
+
+  # Departed people who never owned a bucket: looked up only so we know not to pick them as delegates.
+  departed_only_ids = setsubtract(local.departed_ids, local.owner_ids)
 }
 
 # Owners (still readable by ID after deactivation)
 data "okta_user" "owner" {
   for_each = local.owner_ids
+  user_id  = each.value
+}
+
+data "okta_user" "departed_only" {
+  for_each = local.departed_only_ids
   user_id  = each.value
 }
 
@@ -33,8 +48,9 @@ locals {
   identity_store_id = tolist(data.aws_ssoadmin_instances.this.identity_store_ids)[0]
   account_id        = data.aws_caller_identity.current.account_id
 
-  manager_map = { for k, v in var.manager : lower(k) => lower(v) }
-  fallback    = var.fallback_delegate_email == null ? null : lower(var.fallback_delegate_email)
+  manager_map        = { for k, v in var.manager : lower(k) => lower(v) }
+  fallback           = var.fallback_delegate_email == null ? null : lower(var.fallback_delegate_email)
+  delegate_usernames = { for k, v in var.delegate_username_overrides : lower(k) => v }
 
   # Owner facts. Names derive from the OWNER so they never change on offboarding.
   owners = {
@@ -45,11 +61,15 @@ locals {
       slug       = replace(lower(split("@", u.email)[0]), "/[^a-z0-9-]/", "-")
       hash       = substr(md5(lower(u.email)), 0, 8)
       offboarded = contains(local.offboarded_ids, id)
+      departed   = contains(local.departed_ids, id)
     }
   }
 
-  # Anyone already offboarded cannot inherit from someone else.
-  offboarded_emails = toset([for o in local.owners : o.email if o.offboarded])
+  # Emails that must never be chosen as a delegate.
+  unavailable_emails = toset(concat(
+    [for o in local.owners : o.email if o.offboarded || o.departed],
+    [for u in data.okta_user.departed_only : lower(u.email)],
+  ))
 
   # Management chain, 5 levels ("" = no further manager). Extend by adding chain_6...
   chain_1 = { for id, o in local.owners : id => lookup(local.manager_map, o.email, "") }
@@ -64,26 +84,26 @@ locals {
     ])
   }
 
-  # First chain member who is not offboarded and not the owner (guards against cycles); else fallback.
+  # First chain member who is available and is not the owner (guards against cycles); else fallback.
   delegate_email = {
     for id, o in local.owners : id => try(
-      [for c in local.chain[id] : c if !contains(local.offboarded_emails, c) && c != o.email][0],
+      [for c in local.chain[id] : c if !contains(local.unavailable_emails, c) && c != o.email][0],
       local.fallback
     )
   }
 
-  # Effective recipient: owner while active; delegate once offboarded.
-  # NOTE: the delegate's Identity Center userName is assumed to equal their email.
+  # Effective recipient: the owner while active; the delegate once offboarded.
   users = {
     for id, o in local.owners : id => merge(o, {
       delegate_email  = local.delegate_email[id]
       delegate_source = !o.offboarded ? "owner" : (local.delegate_email[id] == null ? "none" : (local.delegate_email[id] == local.fallback ? "fallback" : "manager-chain"))
       effective_email = o.offboarded ? local.delegate_email[id] : o.email
-      effective_login = o.offboarded ? local.delegate_email[id] : o.login
+      effective_login = o.offboarded ? (local.delegate_email[id] == null ? null : lookup(local.delegate_usernames, local.delegate_email[id], local.delegate_email[id])) : (var.scim_username_attribute == "login" ? o.login : o.email)
 
-      bucket_name    = "${var.name_prefix}-${substr(o.slug, 0, 30)}-${o.hash}"
-      topic_name     = "${var.name_prefix}-notify-${substr(o.slug, 0, 30)}-${o.hash}"
-      permission_set = "${var.name_prefix}-${substr(o.slug, 0, 16)}-${o.hash}" # <= 32 chars
+      bucket_name = "${var.name_prefix}-${substr(o.slug, 0, 30)}-${o.hash}"
+      # Name-length budgets: SNS/EventBridge <= 64 incl. "-cfg"; permission set <= 32.
+      topic_name     = "${var.name_prefix}-n-${substr(o.slug, 0, 24)}-${o.hash}"
+      permission_set = "${var.name_prefix}-${substr(o.slug, 0, max(0, 22 - length(var.name_prefix)))}-${o.hash}"
     })
   }
 }
@@ -131,7 +151,7 @@ data "aws_identitystore_user" "principal" {
 resource "aws_s3_bucket" "user" {
   for_each      = local.users
   bucket        = each.value.bucket_name
-  force_destroy = false
+  force_destroy = var.bucket_force_destroy
 
   tags = {
     Owner          = each.value.email
@@ -184,6 +204,28 @@ resource "aws_s3_bucket_server_side_encryption_configuration" "user" {
       sse_algorithm = "AES256"
     }
   }
+}
+
+resource "aws_s3_bucket_lifecycle_configuration" "user" {
+  for_each = var.bucket_noncurrent_version_expiration_days > 0 ? local.users : {}
+  bucket   = aws_s3_bucket.user[each.key].id
+
+  rule {
+    id     = "expire-noncurrent-and-abort-multipart"
+    status = "Enabled"
+
+    filter {}
+
+    noncurrent_version_expiration {
+      noncurrent_days = var.bucket_noncurrent_version_expiration_days
+    }
+
+    abort_incomplete_multipart_upload {
+      days_after_initiation = 7
+    }
+  }
+
+  depends_on = [aws_s3_bucket_versioning.user]
 }
 
 data "aws_iam_policy_document" "bucket" {
@@ -314,20 +356,24 @@ data "aws_iam_policy_document" "topic" {
     }
   }
 
-  statement {
-    sid       = "AllowEventBridgePublish"
-    actions   = ["sns:Publish"]
-    resources = [aws_sns_topic.user[each.key].arn]
+  dynamic "statement" {
+    for_each = var.enable_config_change_notifications ? [1] : []
 
-    principals {
-      type        = "Service"
-      identifiers = ["events.amazonaws.com"]
-    }
+    content {
+      sid       = "AllowEventBridgePublish"
+      actions   = ["sns:Publish"]
+      resources = [aws_sns_topic.user[each.key].arn]
 
-    condition {
-      test     = "ArnEquals"
-      variable = "aws:SourceArn"
-      values   = [aws_cloudwatch_event_rule.bucket_changes[each.key].arn]
+      principals {
+        type        = "Service"
+        identifiers = ["events.amazonaws.com"]
+      }
+
+      condition {
+        test     = "ArnEquals"
+        variable = "aws:SourceArn"
+        values   = [aws_cloudwatch_event_rule.bucket_changes[each.key].arn]
+      }
     }
   }
 }
@@ -344,14 +390,14 @@ resource "aws_s3_bucket_notification" "user" {
 
   topic {
     topic_arn = aws_sns_topic.user[each.key].arn
-    events    = ["s3:ObjectCreated:*", "s3:ObjectRemoved:*"]
+    events    = var.bucket_object_event_types
   }
 
   depends_on = [aws_sns_topic_policy.user]
 }
 
 resource "aws_cloudwatch_event_rule" "bucket_changes" {
-  for_each    = local.users
+  for_each    = var.enable_config_change_notifications ? local.users : {}
   name        = "${each.value.topic_name}-cfg"
   description = "Configuration changes on ${each.value.bucket_name}"
 
@@ -361,20 +407,7 @@ resource "aws_cloudwatch_event_rule" "bucket_changes" {
     "detail-type" = ["AWS API Call via CloudTrail"]
     detail = {
       eventSource = ["s3.amazonaws.com"]
-      eventName = [
-        "PutBucketPolicy", "DeleteBucketPolicy",
-        "PutBucketAcl",
-        "PutBucketPublicAccessBlock", "DeletePublicAccessBlock",
-        "PutBucketVersioning",
-        "PutBucketEncryption", "DeleteBucketEncryption",
-        "PutBucketOwnershipControls", "DeleteBucketOwnershipControls",
-        "PutBucketLifecycle", "PutBucketLifecycleConfiguration", "DeleteBucketLifecycle",
-        "PutBucketReplication", "DeleteBucketReplication",
-        "PutBucketNotification", "PutBucketNotificationConfiguration",
-        "PutBucketTagging", "DeleteBucketTagging",
-        "PutBucketCors", "DeleteBucketCors",
-        "DeleteBucket",
-      ]
+      eventName   = var.bucket_config_event_names
       requestParameters = {
         bucketName = [each.value.bucket_name]
       }
@@ -383,7 +416,7 @@ resource "aws_cloudwatch_event_rule" "bucket_changes" {
 }
 
 resource "aws_cloudwatch_event_target" "bucket_changes" {
-  for_each  = local.users
+  for_each  = var.enable_config_change_notifications ? local.users : {}
   rule      = aws_cloudwatch_event_rule.bucket_changes[each.key].name
   target_id = "sns-email"
   arn       = aws_sns_topic.user[each.key].arn
